@@ -1,28 +1,32 @@
 import streamlit as st
-import sqlite3
+import psycopg2
 from datetime import datetime
 import pandas as pd
+import bcrypt
 
-# تنظیم پایگاه داده
+# تنظیمات اتصال به Supabase
+def get_db_connection():
+    return psycopg2.connect(
+        dbname="postgres",
+        user="postgres",
+        password="your-supabase-password",  # از داشبورد Supabase بگیر
+        host="your-project.supabase.co",   # Project URL از داشبورد
+        port="5432"
+    )
+
+# ایجاد جداول در PostgreSQL
 def init_db():
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
-    # جدول کاربران
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            role TEXT NOT NULL, -- 'athlete' یا 'coach'
+            role TEXT NOT NULL,
             password TEXT NOT NULL,
             profile_picture TEXT
         )
     ''')
-    # اضافه کردن ستون profile_picture اگه وجود نداشته باشه
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN profile_picture TEXT")
-    except sqlite3.OperationalError:
-        pass  # ستون قبلاً وجود داره
-    # جدول اتصال ورزشکار به مربی
     c.execute('''
         CREATE TABLE IF NOT EXISTS athlete_coach (
             athlete_id TEXT,
@@ -32,10 +36,9 @@ def init_db():
             FOREIGN KEY (coach_id) REFERENCES users(user_id)
         )
     ''')
-    # جدول تمرینات
     c.execute('''
         CREATE TABLE IF NOT EXISTS workouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             athlete_id TEXT NOT NULL,
             date TEXT NOT NULL,
             goal TEXT,
@@ -50,53 +53,54 @@ def init_db():
     conn.commit()
     conn.close()
 
-# تابع برای ثبت کاربر جدید
+# تابع برای ثبت کاربر جدید با هش رمز
 def register_user(user_id, name, role, password, profile_picture):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     try:
-        c.execute("INSERT INTO users (user_id, name, role, password, profile_picture) VALUES (?, ?, ?, ?, ?)", 
-                  (user_id, name, role, password, profile_picture))
+        c.execute("INSERT INTO users (user_id, name, role, password, profile_picture) VALUES (%s, %s, %s, %s, %s)", 
+                  (user_id, name, role, hashed_password, profile_picture))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        return False  # user_id تکراریه
+    except psycopg2.IntegrityError:
+        return False
     finally:
         conn.close()
 
-# تابع برای ورود کاربر
+# تابع برای ورود کاربر با چک کردن هش رمز
 def login_user(user_id, password):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT role, name, profile_picture FROM users WHERE user_id = ? AND password = ?", 
-              (user_id, password))
+    c.execute("SELECT role, name, profile_picture, password FROM users WHERE user_id = %s", 
+              (user_id,))
     result = c.fetchone()
     conn.close()
-    return result if result else None
+    if result and bcrypt.checkpw(password.encode('utf-8'), result[3]):
+        return (result[0], result[1], result[2])
+    return None
 
 # تابع برای اتصال ورزشکار به مربی
 def link_athlete_to_coach(athlete_id, coach_id):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO athlete_coach (athlete_id, coach_id) VALUES (?, ?)", 
+        c.execute("INSERT INTO athlete_coach (athlete_id, coach_id) VALUES (%s, %s)", 
                   (athlete_id, coach_id))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        return False  # اتصال تکراری یا خطا
+    except psycopg2.IntegrityError:
+        return False
     finally:
         conn.close()
 
 # تابع برای چک کردن دسترسی
 def has_access(user_id, athlete_id):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
-    # اگر کاربر خودش ورزشکاره
     if user_id == athlete_id:
         return True
-    # اگر کاربر مربیه
-    c.execute("SELECT 1 FROM athlete_coach WHERE athlete_id = ? AND coach_id = ?", 
+    c.execute("SELECT 1 FROM athlete_coach WHERE athlete_id = %s AND coach_id = %s", 
               (athlete_id, user_id))
     result = c.fetchone()
     conn.close()
@@ -104,20 +108,20 @@ def has_access(user_id, athlete_id):
 
 # تابع برای ثبت تمرین
 def save_workout(athlete_id, date, goal, muscles, type, duration, intensity, recorded_by):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
         INSERT INTO workouts (athlete_id, date, goal, muscles, type, duration, intensity, recorded_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     ''', (athlete_id, date, goal, muscles, type, duration, intensity, recorded_by))
     conn.commit()
     conn.close()
 
 # تابع برای گرفتن تاریخچه
 def get_workouts(athlete_id):
-    conn = sqlite3.connect("workouts.db")
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM workouts WHERE athlete_id = ?", (athlete_id,))
+    c.execute("SELECT * FROM workouts WHERE athlete_id = %s", (athlete_id,))
     workouts = c.fetchall()
     conn.close()
     return workouts
@@ -164,12 +168,18 @@ if st.sidebar.button("ثبت‌نام"):
 # نمایش هدر با نام و عکس
 if st.session_state.user_id:
     st.markdown(f"""
-        <div style='display: flex; align-items: center;'>
+        <div style='display: flex; align-items: center; gap: 10px;'>
             <h2>خوش آمدید، {st.session_state.name}</h2>
         </div>
+        <style>
+            h2 {{ margin: 0; color: #333; }}
+        </style>
     """, unsafe_allow_html=True)
     if st.session_state.profile_picture:
-        st.image(st.session_state.profile_picture, width=100)
+        try:
+            st.image(st.session_state.profile_picture, width=100)
+        except:
+            st.image("https://via.placeholder.com/100", width=100)
 
     # فرم اتصال ورزشکار به مربی (فقط برای مربی)
     if st.session_state.role == "مربی":
@@ -185,9 +195,9 @@ if st.session_state.user_id:
     st.header("ثبت تمرین")
     with st.form("workout_form"):
         athlete_id = st.text_input("شناسه ورزشکار (مثل نام یا ID)")
-        goal = st.text_input("هدف جلسه (مثل چربی‌سوزی، عضله سازی و ...)")
-        muscles = st.text_input("عضلات درگیر (مثل سینه، شانه، فول بادی و ...)")
-        type = st.text_input("نوع تمرین (مثل دایره ای، سوپر ست، تریپل و ...)")  # تغییر به text_input
+        goal = st.text_input("هدف جلسه (مثل چربی‌سوزی، عضله‌سازی و ...)")
+        muscles = st.text_input("عضلات درگیر (مثل سینه، شانه، فول‌بادی و ...)")
+        type = st.text_input("نوع تمرین (مثل دایره‌ای، سوپر ست، تریپل و ...)")
         duration = st.number_input("مدت زمان (دقیقه)", min_value=0, step=1)
         intensity = st.slider("شدت تمرین (1 تا 10)", 1, 10, 5)
         recorded_by = st.selectbox("ثبت‌کننده", ["ورزشکار", "مربی"])
